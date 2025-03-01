@@ -53,6 +53,7 @@ struct VkLayerDispatchTable
 	PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
 	PFN_vkDestroyDevice DestroyDevice;
 	PFN_vkCreateShaderModule CreateShaderModule;
+	PFN_vkDestroyShaderModule DestroyShaderModule;
 	PFN_vkCreateShadersEXT CreateShadersEXT;
 	PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
 	PFN_vkCreateComputePipelines CreateComputePipelines;

@@ -8,12 +8,15 @@
 #include "rapidjson/document.h"
 
 #include "dispatch_helper.hpp"
+#include "path_utils.hpp"
 #include "fossilize_hasher.hpp"
 #include "compiler.hpp"
 #include "spirv_glsl.hpp"
 #include <string>
 #include <algorithm>
 #include <vector>
+#include <mutex>
+#include <unordered_set>
 #include <stdlib.h>
 
 extern "C"
@@ -31,6 +34,7 @@ VK_LAYER_PYROVEIL_vkGetInstanceProcAddr(VkInstance instance, const char *pName);
 struct ScratchAllocator
 {
 	void *copyRaw(const void *data, size_t size);
+	void *allocBytes(size_t size);
 
 	template <typename T>
 	T *copy(const T *v, size_t count)
@@ -52,14 +56,13 @@ struct ScratchAllocator
 	std::vector<std::unique_ptr<void, MallocDeleter>> blocks;
 };
 
-void *ScratchAllocator::copyRaw(const void *data, size_t size)
+void *ScratchAllocator::allocBytes(size_t size)
 {
 	size_t offset = (block.offset + alignof(std::max_align_t) - 1) & ~(alignof(std::max_align_t) - 1);
 
 	if (offset + size < block.size)
 	{
 		void *copyData = block.data + offset;
-		memcpy(copyData, data, size);
 		block.offset = offset + size;
 		return copyData;
 	}
@@ -68,26 +71,28 @@ void *ScratchAllocator::copyRaw(const void *data, size_t size)
 		auto allocSize = std::max<size_t>(4096, size);
 		blocks.emplace_back(::malloc(allocSize));
 		block = { static_cast<uint8_t *>(blocks.back().get()), 0, allocSize };
-		memcpy(block.data, data, size);
 		block.offset = size;
 		return block.data;
 	}
 }
 
+void *ScratchAllocator::copyRaw(const void *data, size_t size)
+{
+	void *ptr = allocBytes(size);
+	if (ptr)
+		memcpy(ptr, data, size);
+	return ptr;
+}
+
 struct Action
 {
+	Hash hash = 0;
 	bool glslRoundtrip = false;
 };
 
 struct Instance
 {
 	void init(VkInstance instance_, const VkApplicationInfo *pApplicationInfo, PFN_vkGetInstanceProcAddr gpa_);
-	Action checkOverrideShader(const VkShaderModuleCreateInfo &createInfo, bool knowsEntryPoint,
-	                           spv::ExecutionModel *model, uint32_t *spirvVersion) const;
-	bool overrideShader(VkShaderModuleCreateInfo &createInfo,
-	                    const char *pName, VkShaderStageFlagBits stage,
-	                    ScratchAllocator &alloc) const;
-	void overrideStage(VkPipelineShaderStageCreateInfo *stageInfo, ScratchAllocator &alloc) const;
 
 	const VkLayerInstanceDispatchTable *getTable() const
 	{
@@ -116,16 +121,21 @@ struct Instance
 	struct Match
 	{
 		Hash fossilizeModuleHash = 0;
+		Hash fossilizeModuleHashLo = 0;
+		Hash fossilizeModuleHashHi = 0;
 		std::string opStringSearch;
 		spv::ExecutionModel spirvExecutionModel = spv::ExecutionModelMax;
 		Action action;
 	};
 	std::vector<Match> globalMatches;
+	std::vector<std::string> disabledExtensions;
+	std::string roundtripCachePath;
+	std::string configPath;
 };
 
 void Instance::parseConfig(const rapidjson::Document &doc)
 {
-	if (!doc.HasMember("version") || !doc["version"].IsInt() || doc["version"].GetUint() != 1)
+	if (!doc.HasMember("version") || !doc["version"].IsInt() || doc["version"].GetUint() != 2)
 	{
 		fprintf(stderr, "pyroveil: Unexpected version.\n");
 		return;
@@ -139,6 +149,13 @@ void Instance::parseConfig(const rapidjson::Document &doc)
 
 	if (!doc.HasMember("matches"))
 		return;
+
+	if (doc.HasMember("disabledExtensions"))
+	{
+		auto &exts = doc["disabledExtensions"];
+		for (auto itr = exts.Begin(); itr != exts.End(); ++itr)
+			disabledExtensions.emplace_back(itr->GetString());
+	}
 
 	active = true;
 
@@ -157,6 +174,19 @@ void Instance::parseConfig(const rapidjson::Document &doc)
 			{
 				m.fossilizeModuleHash = strtoull(v.GetString(), nullptr, 16);
 				fprintf(stderr, "pyroveil: Adding match for fossilizeModuleHash: %016llx.\n", static_cast<unsigned long long>(m.fossilizeModuleHash));
+			}
+		}
+
+		if (match.HasMember("fossilizeModuleHashRange"))
+		{
+			auto &v = match["fossilizeModuleHashRange"];
+			if (v.IsArray() && v.Size() == 2 && v[0].IsString() && v[1].IsString())
+			{
+				m.fossilizeModuleHashLo = strtoull(v[0].GetString(), nullptr, 16);
+				m.fossilizeModuleHashHi = strtoull(v[1].GetString(), nullptr, 16);
+				fprintf(stderr, "pyroveil: Adding match for fossilizeModuleHash range [%016llx, %016llx].\n",
+				        static_cast<unsigned long long>(m.fossilizeModuleHashLo),
+				        static_cast<unsigned long long>(m.fossilizeModuleHashHi));
 			}
 		}
 
@@ -192,6 +222,16 @@ void Instance::parseConfig(const rapidjson::Document &doc)
 
 		globalMatches.push_back(std::move(m));
 	}
+
+	if (doc.HasMember("roundtripCache"))
+	{
+		auto &v = doc["roundtripCache"];
+		if (v.IsString())
+		{
+			roundtripCachePath = Path::relpath(configPath, v.GetString());
+			fprintf(stderr, "pyroveil: Configured roundtripCachePath to \"%s\".\n", roundtripCachePath.c_str());
+		}
+	}
 }
 
 void Instance::init(VkInstance instance_, const VkApplicationInfo *pApplicationInfo, PFN_vkGetInstanceProcAddr gpa_)
@@ -217,6 +257,8 @@ void Instance::init(VkInstance instance_, const VkApplicationInfo *pApplicationI
 
 	if (file)
 	{
+		configPath = env;
+
 		fprintf(stderr, "pyroveil: Found config in %s!\n", env);
 		fseek(file.get(), 0, SEEK_END);
 		size_t len = ftell(file.get());
@@ -317,8 +359,53 @@ static Hash computeHashShaderModule(const VkShaderModuleCreateInfo &createInfo)
 	return h.get();
 }
 
-Action Instance::checkOverrideShader(const VkShaderModuleCreateInfo &createInfo, bool knowsEntryPoint,
-                                     spv::ExecutionModel *model, uint32_t *spirvVersion) const
+struct Device
+{
+	void init(VkPhysicalDevice gpu_, VkDevice device_, Instance *instance_, PFN_vkGetDeviceProcAddr gpa);
+
+	const VkLayerDispatchTable *getTable() const
+	{
+		return &table;
+	}
+
+	VkDevice getDevice() const
+	{
+		return device;
+	}
+
+	VkPhysicalDevice getPhysicalDevice() const
+	{
+		return gpu;
+	}
+
+	Instance *getInstance() const
+	{
+		return instance;
+	}
+
+	Action checkOverrideShader(const VkShaderModuleCreateInfo &createInfo, bool knowsEntryPoint,
+	                           spv::ExecutionModel *model, uint32_t *spirvVersion) const;
+	bool overrideShader(VkShaderModuleCreateInfo &createInfo,
+	                    const char *pName, VkShaderStageFlagBits stage,
+	                    ScratchAllocator &alloc) const;
+	void overrideStage(VkPipelineShaderStageCreateInfo *stageInfo, ScratchAllocator &alloc) const;
+	bool overrideShaderFromCache(Hash hash, VkShaderModuleCreateInfo &createInfo,
+	                             const char *pName, VkShaderStageFlagBits stage,
+	                             ScratchAllocator &alloc) const;
+	void placeOverrideShaderInCache(Hash hash, const VkShaderModuleCreateInfo &createInfo,
+	                                const char *pName, VkShaderStageFlagBits stage) const;
+
+	VkPhysicalDevice gpu = VK_NULL_HANDLE;
+	VkDevice device = VK_NULL_HANDLE;
+	Instance *instance = nullptr;
+	VkLayerDispatchTable table = {};
+
+	mutable std::mutex lock;
+	std::unordered_set<VkShaderModule> overriddenModules;
+};
+
+Action Device::checkOverrideShader(const VkShaderModuleCreateInfo &createInfo, bool knowsEntryPoint,
+                                   spv::ExecutionModel *model, uint32_t *spirvVersion) const
 {
 	uint32_t codeSize = createInfo.codeSize / sizeof(uint32_t);
 	const auto *data = createInfo.pCode;
@@ -326,15 +413,24 @@ Action Instance::checkOverrideShader(const VkShaderModuleCreateInfo &createInfo,
 	uint32_t offset = 5;
 
 	Action action;
-	Hash hash = computeHashShaderModule(createInfo);
+	action.hash = computeHashShaderModule(createInfo);
 
-	for (auto &match : globalMatches)
+	for (auto &match : instance->globalMatches)
 	{
-		if (match.fossilizeModuleHash && match.fossilizeModuleHash == hash)
+		if (match.fossilizeModuleHash && match.fossilizeModuleHash == action.hash)
 		{
 			action.glslRoundtrip = action.glslRoundtrip || match.action.glslRoundtrip;
 			fprintf(stderr, "pyroveil: Found match for fossilizeModuleHash: %016llx.\n",
-			        static_cast<unsigned long long>(hash));
+			        static_cast<unsigned long long>(action.hash));
+		}
+
+		if ((match.fossilizeModuleHashLo || match.fossilizeModuleHashHi) &&
+		    action.hash >= match.fossilizeModuleHashLo &&
+		    action.hash <= match.fossilizeModuleHashHi)
+		{
+			action.glslRoundtrip = action.glslRoundtrip || match.action.glslRoundtrip;
+			fprintf(stderr, "pyroveil: Found ranged match for fossilizeModuleHash: %016llx.\n",
+			        static_cast<unsigned long long>(action.hash));
 		}
 	}
 
@@ -354,16 +450,16 @@ Action Instance::checkOverrideShader(const VkShaderModuleCreateInfo &createInfo,
 			// We're now declaring code, so just stop parsing, there cannot be any capability ops after this.
 			break;
 		}
-		else if (op == spv::OpString && count > 1)
+		else if (op == spv::OpString && count > 2)
 		{
-			auto str = extractString(data + offset + 1, count - 1);
-			for (auto &match : globalMatches)
+			auto str = extractString(data + offset + 2, count - 2);
+			for (auto &match : instance->globalMatches)
 			{
 				if (!match.opStringSearch.empty() && str.find(match.opStringSearch) != std::string::npos)
 				{
 					action.glslRoundtrip = action.glslRoundtrip || match.action.glslRoundtrip;
 					fprintf(stderr, "pyroveil: Found match for opStringSearch: \"%s\" in %016llx.\n",
-					        str.c_str(), static_cast<unsigned long long>(hash));
+					        str.c_str(), static_cast<unsigned long long>(action.hash));
 				}
 			}
 		}
@@ -371,12 +467,12 @@ Action Instance::checkOverrideShader(const VkShaderModuleCreateInfo &createInfo,
 		{
 			numEntryPoints++;
 			*model = static_cast<spv::ExecutionModel>(data[offset + 1]);
-			for (auto &match : globalMatches)
+			for (auto &match : instance->globalMatches)
 			{
 				if (*model == match.spirvExecutionModel)
 				{
 					action.glslRoundtrip = action.glslRoundtrip || match.action.glslRoundtrip;
-					fprintf(stderr, "pyroveil: Found match for execution model in %016llx.\n", static_cast<unsigned long long>(hash));
+					fprintf(stderr, "pyroveil: Found match for execution model in %016llx.\n", static_cast<unsigned long long>(action.hash));
 				}
 			}
 		}
@@ -392,9 +488,86 @@ Action Instance::checkOverrideShader(const VkShaderModuleCreateInfo &createInfo,
 	return action;
 }
 
-bool Instance::overrideShader(VkShaderModuleCreateInfo &createInfo,
-                              const char *entry, VkShaderStageFlagBits stage,
-                              ScratchAllocator &alloc) const
+static std::string generateCachePath(const std::string &cachePath, Hash hash, const char *pName, VkShaderStageFlagBits stage)
+{
+	char hashStr[17];
+	sprintf(hashStr, "%016llx", static_cast<unsigned long long>(hash));
+	std::string path = cachePath + "/" + hashStr;
+
+	if (pName)
+	{
+		path += ".";
+		path += pName;
+		if (stage != 0)
+		{
+			path += ".";
+			path += std::to_string(stage);
+		}
+	}
+
+	path += ".spv";
+
+	return path;
+}
+
+bool Device::overrideShaderFromCache(Hash hash, VkShaderModuleCreateInfo &createInfo, const char *pName,
+                                     VkShaderStageFlagBits stage, ScratchAllocator &alloc) const
+{
+	auto path = generateCachePath(instance->roundtripCachePath, hash, pName, stage);
+
+	FILE *file = fopen(path.c_str(), "rb");
+	if (!file)
+		return false;
+
+	fseek(file, 0, SEEK_END);
+	size_t len = ftell(file);
+	rewind(file);
+
+	auto *pCode = static_cast<uint32_t *>(alloc.allocBytes(len));
+	bool ret = false;
+
+	if (fread(pCode, 1, len, file) == len)
+	{
+		ret = true;
+		createInfo.pCode = pCode;
+		createInfo.codeSize = len;
+		fprintf(stderr, "pyroveil: Pulled %s from roundtrip cache.\n", path.c_str());
+	}
+
+	fclose(file);
+	return ret;
+}
+
+void Device::placeOverrideShaderInCache(Hash hash, const VkShaderModuleCreateInfo &createInfo, const char *pName,
+                                        VkShaderStageFlagBits stage) const
+{
+	auto path = generateCachePath(instance->roundtripCachePath, hash, pName, stage);
+	auto pathTmp = path + ".tmp";
+
+	// This can happen concurrently, so need atomic rename technique.
+	FILE *file = fopen(pathTmp.c_str(), "wbx");
+	if (!file)
+		return;
+
+	bool success = fwrite(createInfo.pCode, 1, createInfo.codeSize, file) == createInfo.codeSize;
+	fclose(file);
+
+	if (!success)
+	{
+		fprintf(stderr, "pyroveil: Failed to write complete file to %s.\n", pathTmp.c_str());
+		remove(pathTmp.c_str());
+		return;
+	}
+
+	if (rename(pathTmp.c_str(), path.c_str()) != 0)
+		fprintf(stderr, "pyroveil: Failed to rename file from %s to %s.\n", pathTmp.c_str(), path.c_str());
+
+	fprintf(stderr, "pyroveil: Successfully placed %s in cache.\n", path.c_str());
+}
+
+bool Device::overrideShader(VkShaderModuleCreateInfo &createInfo,
+                            const char *entry, VkShaderStageFlagBits stage,
+                            ScratchAllocator &alloc) const
 {
 	auto model = spv::ExecutionModelMax;
 	uint32_t spirvVersion = 0;
@@ -403,7 +576,14 @@ bool Instance::overrideShader(VkShaderModuleCreateInfo &createInfo,
 	if (!action.glslRoundtrip)
 		return false;
 
+	if (!instance->roundtripCachePath.empty())
+		if (overrideShaderFromCache(action.hash, createInfo, entry, stage, alloc))
+			return true;
+
 	std::string glsl;
+
+	if (!instance->roundtripCachePath.empty())
+		placeOverrideShaderInCache(action.hash, createInfo, "orig", VkShaderStageFlagBits(0));
 
 	try
 	{
@@ -445,15 +625,17 @@ bool Instance::overrideShader(VkShaderModuleCreateInfo &createInfo,
 	}
 	catch (const std::exception &e)
 	{
-		fprintf(stderr, "pyroveil: SPIRV-Cross threw error %s.\n", e.what());
+		fprintf(stderr, "pyroveil: SPIRV-Cross threw error: %s.\n", e.what());
 		return false;
 	}
 
-	auto spirv = compileToSpirv(glsl, model, spirvVersion);
+	auto spirv = compileToSpirv(generateCachePath(instance->roundtripCachePath, action.hash, entry, stage), glsl, model, spirvVersion);
 	if (!spirv.empty())
 	{
 		createInfo.pCode = alloc.copy(spirv.data(), spirv.size());
 		createInfo.codeSize = spirv.size() * sizeof(uint32_t);
+		if (!instance->roundtripCachePath.empty())
+			placeOverrideShaderInCache(action.hash, createInfo, entry, stage);
 		return true;
 	}
 	else
@@ -463,7 +645,7 @@ bool Instance::overrideShader(VkShaderModuleCreateInfo &createInfo,
 	}
 }
 
-void Instance::overrideStage(VkPipelineShaderStageCreateInfo *stageInfo, ScratchAllocator &alloc) const
+void Device::overrideStage(VkPipelineShaderStageCreateInfo *stageInfo, ScratchAllocator &alloc) const
 {
 	auto *moduleCreateInfo = findChain<VkShaderModuleCreateInfo>(stageInfo->pNext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
 	if (moduleCreateInfo && moduleCreateInfo->codeSize)
@@ -479,43 +661,20 @@ void Instance::overrideStage(VkPipelineShaderStageCreateInfo *stageInfo, Scratch
 			}
 
 			stageInfo->pNext = pnext;
+			stageInfo->pName = "main";
 			moduleCreateInfo = findChain<VkShaderModuleCreateInfo>(pnext, VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO);
 			auto &mut = const_cast<VkShaderModuleCreateInfo &>(*moduleCreateInfo);
 			mut.pCode = replaced.pCode;
 			mut.codeSize = replaced.codeSize;
 		}
 	}
+	else if (stageInfo->module)
+	{
+		std::lock_guard<std::mutex> holder{lock};
+		if (overriddenModules.count(stageInfo->module))
+			stageInfo->pName = "main";
+	}
 }
-
-struct Device
-{
-	void init(VkPhysicalDevice gpu_, VkDevice device_, Instance *instance_, PFN_vkGetDeviceProcAddr gpa);
-
-	const VkLayerDispatchTable *getTable() const
-	{
-		return &table;
-	}
-
-	VkDevice getDevice() const
-	{
-		return device;
-	}
-
-	VkPhysicalDevice getPhysicalDevice() const
-	{
-		return gpu;
-	}
-
-	Instance *getInstance() const
-	{
-		return instance;
-	}
-
-	VkPhysicalDevice gpu = VK_NULL_HANDLE;
-	VkDevice device = VK_NULL_HANDLE;
-	Instance *instance = nullptr;
-	VkLayerDispatchTable table = {};
-};
 
 #include "dispatch_wrapper.hpp"
 
@@ -613,7 +772,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateGraphicsPipelines(
 	{
 		createInfos[i].pStages = scratch.copy(createInfos[i].pStages, createInfos[i].stageCount);
 		for (uint32_t j = 0; j < createInfos[i].stageCount; j++)
-			layer->getInstance()->overrideStage(const_cast<VkPipelineShaderStageCreateInfo *>(&createInfos[i].pStages[j]), scratch);
+			layer->overrideStage(const_cast<VkPipelineShaderStageCreateInfo *>(&createInfos[i].pStages[j]), scratch);
 	}
 
 	return layer->getTable()->CreateGraphicsPipelines(device, pipelineCache,
@@ -635,7 +794,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateComputePipelines(
 	auto *createInfos = scratch.copy(pCreateInfos, createInfoCount);
 
 	for (uint32_t i = 0; i < createInfoCount; i++)
-		layer->getInstance()->overrideStage(&createInfos[i].stage, scratch);
+		layer->overrideStage(&createInfos[i].stage, scratch);
 
 	return layer->getTable()->CreateComputePipelines(device, pipelineCache,
 	                                                 createInfoCount, createInfos, pAllocator,
@@ -660,7 +819,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateRayTracingPipelinesKHR(
 	{
 		createInfos[i].pStages = scratch.copy(createInfos[i].pStages, createInfos[i].stageCount);
 		for (uint32_t j = 0; j < createInfos[i].stageCount; j++)
-			layer->getInstance()->overrideStage(const_cast<VkPipelineShaderStageCreateInfo *>(&createInfos[i].pStages[j]), scratch);
+			layer->overrideStage(const_cast<VkPipelineShaderStageCreateInfo *>(&createInfos[i].pStages[j]), scratch);
 	}
 
 	return layer->getTable()->CreateRayTracingPipelinesKHR(device, deferredOperation, pipelineCache,
@@ -677,10 +836,37 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateShaderModule(
 	auto *layer = getDeviceLayer(device);
 
 	ScratchAllocator scratch;
+	bool overrides = false;
 	auto tmpCreateInfo = *pCreateInfo;
-	layer->getInstance()->overrideShader(tmpCreateInfo, nullptr, VK_SHADER_STAGE_ALL, scratch);
+	if (layer->overrideShader(tmpCreateInfo, nullptr, VK_SHADER_STAGE_ALL, scratch))
+		overrides = true;
 
-	return layer->getTable()->CreateShaderModule(device, &tmpCreateInfo, pAllocator, pShaderModule);
+	VkResult vr = layer->getTable()->CreateShaderModule(device, &tmpCreateInfo, pAllocator, pShaderModule);
+	if (vr != VK_SUCCESS)
+		return vr;
+
+	if (overrides)
+	{
+		std::lock_guard<std::mutex> holder{layer->lock};
+		layer->overriddenModules.insert(*pShaderModule);
+	}
+
+	return vr;
+}
+
+static VKAPI_ATTR void VKAPI_CALL DestroyShaderModule(
+		VkDevice device,
+		VkShaderModule shaderModule,
+		const VkAllocationCallbacks *pAllocator)
+{
+	auto *layer = getDeviceLayer(device);
+
+	{
+		std::lock_guard<std::mutex> holder{layer->lock};
+		layer->overriddenModules.erase(shaderModule);
+	}
+
+	layer->getTable()->DestroyShaderModule(device, shaderModule, pAllocator);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL CreateShadersEXT(
@@ -701,10 +887,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateShadersEXT(
 			shaders[i].codeSize, static_cast<const uint32_t *>(shaders[i].pCode),
 		};
 
-		if (layer->getInstance()->overrideShader(info, shaders[i].pName, shaders[i].stage, scratch))
+		if (layer->overrideShader(info, shaders[i].pName, shaders[i].stage, scratch))
 		{
 			shaders[i].pCode = info.pCode;
 			shaders[i].codeSize = info.codeSize;
+			shaders[i].pName = "main";
 		}
 	}
 
@@ -727,8 +914,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(
 		return vr;
 
 	// Filter out extensions we cannot deal with yet in SPIRV-Cross.
-	auto itr = std::remove_if(props.begin(), props.end(), [](const VkExtensionProperties &ext) {
-		return strcmp(ext.extensionName, VK_NV_RAW_ACCESS_CHAINS_EXTENSION_NAME) == 0;
+	auto itr = std::remove_if(props.begin(), props.end(), [layer, pProperties](const VkExtensionProperties &ext) {
+		for (auto &disabledExt : layer->disabledExtensions)
+		{
+			if (disabledExt == ext.extensionName)
+			{
+				// Only log once.
+				if (pProperties)
+					fprintf(stderr, "pyroveil: Disabling extension %s.\n", ext.extensionName);
+				return true;
+			}
+		}
+		return false;
 	});
 	props.erase(itr, props.end());
 
@@ -810,6 +1007,7 @@ static PFN_vkVoidFunction interceptDeviceCommand(const char *pName)
 		{ "vkGetDeviceProcAddr", reinterpret_cast<PFN_vkVoidFunction>(VK_LAYER_PYROVEIL_vkGetDeviceProcAddr) },
 		{ "vkDestroyDevice", reinterpret_cast<PFN_vkVoidFunction>(DestroyDevice) },
 		{ "vkCreateShaderModule", reinterpret_cast<PFN_vkVoidFunction>(CreateShaderModule) },
+		{ "vkDestroyShaderModule", reinterpret_cast<PFN_vkVoidFunction>(DestroyShaderModule) },
 		{ "vkCreateShadersEXT", reinterpret_cast<PFN_vkVoidFunction>(CreateShadersEXT) },
 		{ "vkCreateGraphicsPipelines", reinterpret_cast<PFN_vkVoidFunction>(CreateGraphicsPipelines) },
 		{ "vkCreateComputePipelines", reinterpret_cast<PFN_vkVoidFunction>(CreateComputePipelines) },

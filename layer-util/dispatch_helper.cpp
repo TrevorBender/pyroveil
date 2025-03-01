@@ -29,6 +29,7 @@ void layerInitDeviceDispatchTable(VkDevice device, VkLayerDispatchTable *table, 
 	F(GetDeviceProcAddr);
 	F(DestroyDevice);
 	F(CreateShaderModule);
+	F(DestroyShaderModule);
 	F(CreateShadersEXT);
 	F(CreateGraphicsPipelines);
 	F(CreateComputePipelines);

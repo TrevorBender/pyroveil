@@ -5,7 +5,7 @@
 #include "compiler.hpp"
 #include "shaderc/shaderc.hpp"
 
-std::vector<uint32_t> compileToSpirv(const std::string &glsl, spv::ExecutionModel stage, uint32_t spirvVersion)
+std::vector<uint32_t> compileToSpirv(const std::string &name, const std::string &glsl, spv::ExecutionModel stage, uint32_t spirvVersion)
 {
 	shaderc::Compiler compiler;
 	shaderc::CompileOptions options;
@@ -46,7 +46,7 @@ std::vector<uint32_t> compileToSpirv(const std::string &glsl, spv::ExecutionMode
 
 	shaderc::SpvCompilationResult result;
 
-	result = compiler.CompileGlslToSpv(glsl, kind, "roundtrip.glsl", options);
+	result = compiler.CompileGlslToSpv(glsl, kind, name.c_str(), options);
 	if (result.GetCompilationStatus() != shaderc_compilation_status_success)
 	{
 		fprintf(stderr, "pyroveil: Failed to convert GLSL: %s\n", result.GetErrorMessage().c_str());
